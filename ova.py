@@ -291,7 +291,7 @@ def launch_via_protocol(cookie, cfg_game_id):
         # start using start (let OS handle protocol)
         subprocess.Popen(["cmd", "/c", "start", "", protocol], shell=True)
     except Exception as e:
-        return None, f"start-failed:{e}"
+        return None, "start-failed"
     # find new pid
     new_pid = find_new_roblox_pid(before, timeout=25)
     if new_pid:
@@ -343,7 +343,7 @@ def arrange_windows_for_pids(pid_ordered_list, config):
                 move_resize_hwnd(chosen, x, y, w, h)
                 placed += 1
     except Exception as e:
-        log(f"Arrange windows error: {e}")
+        pass  # ignore arrangement errors
 
 # ----------------------------
 # Main logic
@@ -394,6 +394,9 @@ def main():
     last_launch_time = 0
     launch_delay = float(cfg.get("launchDelay", 15))
 
+    # Flag untuk menandai apakah ini adalah iterasi pertama
+    first_iteration = True
+
     # live table
     with Live(refresh_per_second=4, console=console, screen=True) as live:
         while True:
@@ -401,7 +404,7 @@ def main():
             if cfg.get("Kill Process > Ram", False):
                 ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
                 killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, launch_delay, cfg.get("gameId"))
-                if killed_count > 0:
+                if killed_count > 0 and first_iteration:
                     log(f"Restarted {killed_count} processes karena penggunaan RAM tinggi")
 
             # For arranging windows later, collect pid order list
@@ -411,7 +414,7 @@ def main():
             table.add_column("No.", justify="right", width=3)
             table.add_column("Username", overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("Status", width=20)  # Kolom PID dihapus
+            table.add_column("Status", width=20)
 
             # iterate accounts and update
             for i, acc in enumerate(accounts, start=1):
@@ -420,7 +423,7 @@ def main():
                 name = acc["username"]
                 pid = acc.get("pid")
 
-                presence = get_presence(cookie, uid)  # -1 unknown, 0 offline,1 online,2 ingame,3 instudio
+                presence = get_presence(cookie, uid)
 
                 # normalize presence string
                 PRES_MAP = { -1: "Unknown", 0: "Offline", 1: "Online", 2: "InGame", 3: "InStudio" }
@@ -442,13 +445,6 @@ def main():
                     acc["pid"] = None  # reset if pid died
 
                 # Logic:
-                # - If Offline:
-                #    - if pid_running is True: increment offline_count; if offline_count >= maxOfflineChecks -> kill pid, launch new
-                #    - else pid not running -> launch immediately (with delay)
-                # - If Online:
-                #    - increment online_count; if >= maxOnlineChecks -> kill pid (if exists) and launch new
-                # - If InGame:
-                #    - reset counters
                 status_msg = ""
                 launched_pid = None
                 needs_launch = False
@@ -458,23 +454,21 @@ def main():
                         acc["offline_count"] += 1
                         acc["online_count"] = 0
                         status_msg = f"Offline (proc running) {acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}"
-                        # if offline_count reached threshold -> kill + relaunch
                         if acc["offline_count"] >= int(cfg.get("maxOfflineChecks", 3)):
-                            log(f"{name}: Offline {acc['offline_count']}x with process {pid} running -> restarting")
+                            if first_iteration:
+                                log(f"{name}: Offline {acc['offline_count']}x with process {pid} running -> restarting")
                             killed = kill_pid(pid)
-                            if killed:
+                            if killed and first_iteration:
                                 log(f"{name}: killed pid {pid}")
-                                acc["pid"] = None
-                                time.sleep(1)
-                            else:
-                                log(f"{name}: failed kill pid {pid} or already gone")
+                            acc["pid"] = None
+                            time.sleep(1)
                             needs_launch = True
                     else:
-                        # no process running -> launch immediately
                         acc["offline_count"] = 0
                         acc["online_count"] = 0
                         status_msg = "Offline -> launching"
-                        log(f"{name} - Offline (no pid) -> launching")
+                        if first_iteration:
+                            log(f"{name} - Offline (no pid) -> launching")
                         needs_launch = True
 
                 elif presence == 1:  # Online
@@ -482,13 +476,13 @@ def main():
                     acc["offline_count"] = 0
                     status_msg = f"Online {acc['online_count']}/{cfg.get('maxOnlineChecks',3)}"
                     if acc["online_count"] >= int(cfg.get("maxOnlineChecks", 3)):
-                        log(f"{name}: Online stuck {acc['online_count']}x -> restarting")
-                        # kill pid if running, then relaunch
+                        if first_iteration:
+                            log(f"{name}: Online stuck {acc['online_count']}x -> restarting")
                         if pid_running and pid:
-                            if kill_pid(pid):
+                            if kill_pid(pid) and first_iteration:
                                 log(f"{name}: killed pid {pid} before relaunch")
-                                acc["pid"] = None
-                                time.sleep(1)
+                            acc["pid"] = None
+                            time.sleep(1)
                         needs_launch = True
 
                 elif presence == 2:  # InGame
@@ -505,22 +499,22 @@ def main():
                     time_since_last_launch = current_time - last_launch_time
                     
                     if time_since_last_launch < launch_delay:
-                        # Tunggu sampai delay terpenuhi
                         wait_time = launch_delay - time_since_last_launch
                         time.sleep(wait_time)
                     
                     new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
-                    last_launch_time = time.time()  # Update waktu peluncuran terakhir
+                    last_launch_time = time.time()
                     
                     if new_pid:
                         acc["pid"] = new_pid
                         status_msg = f"Launched PID {new_pid}"
-                        log(f"{name}: Launched new PID {new_pid}")
+                        if first_iteration:
+                            log(f"{name}: Launched new PID {new_pid}")
                     else:
                         status_msg = f"Launch failed ({reason})"
-                        log(f"{name}: Launch failed ({reason})")
+                        if first_iteration:
+                            log(f"{name}: Launch failed ({reason})")
                     
-                    # Reset counters setelah peluncuran
                     acc["online_count"] = 0
                     acc["offline_count"] = 0
 
@@ -553,6 +547,12 @@ def main():
             # Update live table
             live.update(table)
 
+            # Set flag first_iteration menjadi False setelah iterasi pertama selesai
+            if first_iteration:
+                first_iteration = False
+                # Clear screen setelah iterasi pertama selesai
+                console.clear()
+
             # arrange windows if enabled
             if cfg.get("ArrangeWindows", True):
                 arrange_windows_for_pids(pid_order, cfg)
@@ -562,4 +562,5 @@ def main():
 
 if __name__ == "__main__":
     log("Starting Roblox Auto Rejoin Monitor (cookies.txt mode)")
+
     main()
