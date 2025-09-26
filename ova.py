@@ -320,6 +320,51 @@ def launch_via_protocol(cookie, cfg_game_id):
     return None, "no-new-pid"
 
 # ----------------------------
+# Duplicate Account Detection
+# ----------------------------
+def detect_and_kill_duplicate_accounts(accounts):
+    """Deteksi dan kill proses untuk akun yang duplikat (username/cookie sama)"""
+    killed_count = 0
+    
+    # Group accounts by username
+    username_groups = {}
+    for acc in accounts:
+        username = acc["username"]
+        if username not in username_groups:
+            username_groups[username] = []
+        username_groups[username].append(acc)
+    
+    # Untuk setiap grup username, jika ada lebih dari 1 account, keep yang terbaru
+    for username, acc_list in username_groups.items():
+        if len(acc_list) > 1:
+            log(f"Detected duplicate account: {username} ({len(acc_list)} instances)")
+            
+            # Sort by PID (yang None dianggap lebih tua), lalu by online_count/offline_count
+            acc_list.sort(key=lambda x: (
+                x["pid"] is None,  # Yang tanpa PID dianggap lebih tua
+                -x.get("online_count", 0),  # Yang online_count lebih tinggi dianggap lebih baru
+                -x.get("offline_count", 0)  # Yang offline_count lebih tinggi dianggap lebih baru
+            ))
+            
+            # Keep the first one (yang dianggap terbaru), kill the rest
+            keep_acc = acc_list[0]
+            for acc in acc_list[1:]:
+                pid = acc.get("pid")
+                if pid and is_roblox_process_running(pid):
+                    if kill_pid(pid):
+                        log(f"Killed duplicate process PID {pid} for {username}")
+                        killed_count += 1
+                    else:
+                        log(f"Failed to kill duplicate process PID {pid} for {username}")
+                
+                # Reset the duplicate account
+                acc["pid"] = None
+                acc["online_count"] = 0
+                acc["offline_count"] = 0
+    
+    return killed_count
+
+# ----------------------------
 # Match existing Roblox processes to accounts
 # ----------------------------
 def match_existing_processes_to_accounts(accounts):
@@ -430,10 +475,23 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
         # Cek status presence
         presence = get_presence(cookie, user_id)
         
+        # Update counters berdasarkan status
+        if presence == 0:  # Offline
+            acc["offline_count"] += 1
+            acc["online_count"] = 0
+        elif presence == 1:  # Online
+            acc["online_count"] += 1
+            acc["offline_count"] = 0
+        else:  # InGame, Unknown, dll
+            acc["online_count"] = 0
+            acc["offline_count"] = 0
+        
         # Kondisi untuk restart:
         # 1. Process tidak berjalan DAN status offline
         # 2. Process tidak berjalan DAN status unknown/error
         # 3. Process berjalan TAPI status offline (process zombie/hang)
+        # 4. Offline count mencapai threshold
+        # 5. Online count mencapai threshold
         
         needs_restart = False
         reason = ""
@@ -447,6 +505,12 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
         elif process_running and presence == 0:  # Process berjalan tapi status offline
             needs_restart = True
             reason = "Process berjalan tapi status Offline (zombie process)"
+        elif acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
+            needs_restart = True
+            reason = f"Offline count {acc['offline_count']} mencapai threshold"
+        elif acc["online_count"] >= int(config.get("maxOnlineChecks", 3)):
+            needs_restart = True
+            reason = f"Online count {acc['online_count']} mencapai threshold"
         
         if needs_restart and config.get("AutoRestart", True):
             # Apply launch delay
@@ -508,6 +572,7 @@ def main():
                 "pid": None,
                 "online_count": 0,
                 "offline_count": 0,
+                "error_count": 0,
             })
             log(f"Loaded {uname} ({uid})")
         else:
@@ -542,11 +607,16 @@ def main():
     # live table - tanpa batasan baris
     with Live(refresh_per_second=4, console=console, screen=False) as live:
         while True:
+            # Deteksi dan kill duplicate accounts
+            killed_duplicates = detect_and_kill_duplicate_accounts(accounts)
+            if killed_duplicates > 0:
+                log(f"Killed {killed_duplicates} duplicate account processes")
+
             # Check RAM usage and kill processes if enabled (berjalan di background)
             if cfg.get("Kill Process > Ram", False):
                 ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
                 killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, launch_delay, cfg.get("gameId"))
-                if killed_count > 0 and first_iteration:
+                if killed_count > 0:
                     log(f"Restarted {killed_count} processes karena penggunaan RAM tinggi")
 
             # Check and restart offline/killed processes
@@ -562,9 +632,7 @@ def main():
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("Status", width=25)
-            table.add_column("PID", width=10)
-            table.add_column("RAM (GB)", width=8)
+            table.add_column("Status", width=40)
 
             # iterate accounts and update
             for i, acc in enumerate(accounts, start=1):
@@ -581,33 +649,32 @@ def main():
 
                 # check if pid still exists and is Roblox process
                 pid_running = is_roblox_process_running(pid)
-                ram_usage = get_process_ram_usage(pid) if pid_running else 0
 
                 # Update PID status jika process mati
                 if not pid_running and pid is not None:
                     acc["pid"] = None
                     pid = None
 
-                # Status message dengan informasi lebih detail
+                # Status message dengan informasi counter
                 status_msg = ""
                 if pid_running:
                     if presence == 2:  # InGame
-                        status_msg = f"✅ In Game ({pid})"
+                        status_msg = f"In Game (PID: {pid})"
                     elif presence == 1:  # Online
-                        status_msg = f"🔵 Online ({pid})"
+                        status_msg = f"Online [{acc['online_count']}/{cfg.get('maxOnlineChecks',3)}] (PID: {pid})"
                     elif presence == 0:  # Offline - process running but status offline
-                        status_msg = f"⚠️ Process running but Offline ({pid})"
+                        status_msg = f"Offline [{acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}] (Process Running)"
                     else:  # Unknown
-                        status_msg = f"❓ Unknown ({pid})"
+                        status_msg = f"Unknown [{acc.get('error_count',0)}] (PID: {pid})"
                 else:
                     if presence == 2:  # InGame but no process
-                        status_msg = "❌ InGame (No Process)"
+                        status_msg = "InGame (No Process - NEED RESTART)"
                     elif presence == 1:  # Online but no process
-                        status_msg = "❌ Online (No Process)"
+                        status_msg = f"Online [{acc['online_count']}/{cfg.get('maxOnlineChecks',3)}] (No Process)"
                     elif presence == 0:  # Offline
-                        status_msg = "🔴 Offline"
+                        status_msg = f"Offline [{acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}]"
                     else:  # Unknown
-                        status_msg = "❓ Unknown"
+                        status_msg = f"Unknown [{acc.get('error_count',0)}]"
 
                 # append pid to pid_order for arranging windows
                 pid_order.append(pid)
@@ -623,26 +690,22 @@ def main():
                     elif presence == 1:  # Online - biru
                         username_text.stylize("bold blue")
                         status_text.stylize("bold blue")
-                    else:  # Other status with running process
+                    else:  # Other status with running process - kuning
                         username_text.stylize("bold yellow")
                         status_text.stylize("bold yellow")
                 else:
                     if presence == 0:  # Offline - merah
                         username_text.stylize("bold red")
                         status_text.stylize("bold red")
-                    else:  # Unknown/other
+                    elif presence in [1, 2]:  # Online/InGame but no process - magenta (urgent)
+                        username_text.stylize("bold magenta")
+                        status_text.stylize("bold magenta")
+                    else:  # Unknown/other - kuning
                         username_text.stylize("bold yellow")
                         status_text.stylize("bold yellow")
 
                 # Tambah row ke table
-                table.add_row(
-                    str(i), 
-                    username_text, 
-                    str(uid), 
-                    status_text,
-                    str(pid) if pid else "N/A",
-                    f"{ram_usage:.2f}" if ram_usage > 0 else "0"
-                )
+                table.add_row(str(i), username_text, str(uid), status_text)
 
             # Update live table
             live.update(table)
@@ -661,7 +724,7 @@ def main():
 if __name__ == "__main__":
     try:
         log("Starting Roblox Auto Rejoin Monitor (Multi-Instance Support)")
-        log("Fitur: Auto-restart ketika process mati/offline")
+        log("Fitur: Auto-restart ketika process mati/offline & Duplicate account detection")
         main()
     except KeyboardInterrupt:
         log("Program dihentikan oleh user")
