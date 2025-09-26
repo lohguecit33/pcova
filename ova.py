@@ -455,8 +455,36 @@ def proc_cycle(accounts, cfg, last_launch_time):
     - memastikan proses Roblox berjalan bila presence offline tetapi pid tidak ada -> langsung launch
     - melakukan pengecekan RAM dan kill jika melebihi threshold (HANYA KILL)
     - memperbarui pid jika process baru ditemukan
+    - tambahan: jika Roblox force close tapi presence akun masih Online/InGame -> force close hanya proses akun itu saja
     """
     pid_order = []
+
+    # helper internal: force close hanya proses Roblox milik akun tertentu
+    def force_close_account_process(acc, timeout=3.0):
+        pid = acc.get("pid")
+        if not pid:
+            return
+        try:
+            proc = psutil.Process(pid)
+            if proc.is_running():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=timeout)
+                except Exception:
+                    pass
+                if proc.is_running():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                log(f"{acc['username']}: force closed Roblox PID {pid}")
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            log(f"{acc['username']}: Error force closing PID {pid}: {e}")
 
     # 1) Deteksi duplicate dan kill duplicates
     killed_duplicates = detect_and_kill_duplicate_accounts(accounts)
@@ -501,14 +529,13 @@ def proc_cycle(accounts, cfg, last_launch_time):
                 log(f"{name}: akun offline & presence={presence} -> launching")
             else:
                 log(f"{name}: PID hilang tapi presence={presence} -> launching")
-            
 
             # cek global launchDelay
             if now - last_launch_time[0] < float(cfg.get("launchDelay", 15)):
-               wait = float(cfg.get("launchDelay", 15)) - (now - last_launch_time[0])
-               log(f"Menunggu {round(wait,1)}s  launch delay (launchDelay config)")
-               time.sleep(wait)
-               console.clear()
+                wait = float(cfg.get("launchDelay", 15)) - (now - last_launch_time[0])
+                log(f"Menunggu {round(wait,1)}s  launch delay (launchDelay config)")
+                time.sleep(wait)
+                console.clear()
 
             new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
             last_launch_time[0] = time.time()
@@ -526,6 +553,22 @@ def proc_cycle(accounts, cfg, last_launch_time):
                 console.clear()
         # kalau pid ada dan jalan, nothing to do here (presence update dilakukan di presence loop)
         pid_order.append(acc.get("pid"))
+
+    # 3b) Tambahan logika:
+    # Jika PID tercatat tapi proses Roblox sebenarnya hilang atau tidak valid,
+    # dan presence akun masih menunjukkan Online/InGame -> force close hanya proses akun itu
+    for acc in accounts:
+        pid = acc.get("pid")
+        if pid and not is_roblox_process_running(pid):
+            presence = get_presence(acc["cookie"], acc["user_id"])
+            if presence in (1, 2):  # Online atau InGame
+                log(f"{acc['username']}: Detected stale PID {pid} + presence={presence} -> force closing this account only")
+                force_close_account_process(acc)
+                # reset account pid & counters supaya logic offline bisa jalan
+                acc["pid"] = None
+                acc["online_count"] = 0
+                acc["offline_count"] = 0
+                acc["unknown_count"] = 0
 
     # return pid_order untuk arrange windows
     return pid_order
