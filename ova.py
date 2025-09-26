@@ -299,6 +299,51 @@ def launch_via_protocol(cookie, cfg_game_id):
     return None, "no-new-pid"
 
 # ----------------------------
+# Match existing Roblox processes to accounts
+# ----------------------------
+def match_existing_processes_to_accounts(accounts):
+    """Mencocokkan proses Roblox yang sudah berjalan dengan akun berdasarkan cookie"""
+    log("Mencari proses Roblox yang sudah berjalan...")
+    
+    # Dapatkan semua proses Roblox yang sedang berjalan
+    roblox_processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'create_time', 'memory_info']):
+        try:
+            if proc.info['name'] and proc.info['name'].lower() in ROBLOX_EXE_NAMES:
+                roblox_processes.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    log(f"Found {len(roblox_processes)} Roblox processes running")
+    
+    # Untuk setiap akun, coba cocokkan dengan proses yang ada
+    matched_count = 0
+    for acc in accounts:
+        if acc.get("pid") is not None:
+            continue  # Skip jika sudah ada PID
+            
+        # Cek status presence untuk menentukan apakah akun sedang dalam game
+        presence = get_presence(acc["cookie"], acc["user_id"])
+        
+        if presence == 2:  # InGame - kemungkinan besar ada proses yang berjalan
+            # Cari proses Roblox yang paling baru
+            if roblox_processes:
+                # Urutkan berdasarkan waktu pembuatan (terbaru pertama)
+                roblox_processes.sort(key=lambda p: p.info['create_time'], reverse=True)
+                
+                # Ambil proses terbaru dan assign ke akun ini
+                newest_proc = roblox_processes[0]
+                acc["pid"] = newest_proc.info['pid']
+                matched_count += 1
+                log(f"Matched existing process PID {newest_proc.info['pid']} to {acc['username']}")
+                
+                # Hapus proses yang sudah dipakai dari list
+                roblox_processes.pop(0)
+    
+    log(f"Berhasil mencocokkan {matched_count} proses yang sudah berjalan")
+    return matched_count
+
+# ----------------------------
 # Arrange windows by pid mapping
 # ----------------------------
 def arrange_windows_for_pids(pid_ordered_list, config):
@@ -390,6 +435,9 @@ def main():
     if total_instances < len(accounts):
         accounts = accounts[:total_instances]
 
+    # Mencocokkan proses yang sudah berjalan dengan akun
+    match_existing_processes_to_accounts(accounts)
+
     # Variables untuk mengontrol delay antar peluncuran
     last_launch_time = 0
     launch_delay = float(cfg.get("launchDelay", 15))
@@ -397,10 +445,13 @@ def main():
     # Flag untuk menandai apakah ini adalah iterasi pertama
     first_iteration = True
 
-    # live table
-    with Live(refresh_per_second=4, console=console, screen=True) as live:
+    # Clear screen sebelum memulai live table
+    console.clear()
+
+    # live table - tanpa batasan baris
+    with Live(refresh_per_second=4, console=console, screen=False) as live:
         while True:
-            # Check RAM usage and kill processes if enabled
+            # Check RAM usage and kill processes if enabled (berjalan di background)
             if cfg.get("Kill Process > Ram", False):
                 ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
                 killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, launch_delay, cfg.get("gameId"))
@@ -410,11 +461,11 @@ def main():
             # For arranging windows later, collect pid order list
             pid_order = []
 
-            table = Table(title="Roblox Auto Rejoin Monitor", expand=True)
-            table.add_column("No.", justify="right", width=3)
-            table.add_column("Username", overflow="fold")
+            table = Table(title="Roblox Auto Rejoin Monitor", show_header=True, header_style="bold magenta")
+            table.add_column("No.", justify="right", width=4)
+            table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("Status", width=20)
+            table.add_column("Status", width=25)
 
             # iterate accounts and update
             for i, acc in enumerate(accounts, start=1):
@@ -429,13 +480,16 @@ def main():
                 PRES_MAP = { -1: "Unknown", 0: "Offline", 1: "Online", 2: "InGame", 3: "InStudio" }
                 pres_str = PRES_MAP.get(presence, "Unknown")
 
-                # check if pid still exists and is Roblox process
+                # check if pid still exists and is Roblox process (background check)
                 pid_running = False
+                ram_usage = 0
                 if pid and psutil.pid_exists(pid):
                     try:
                         p = psutil.Process(pid)
                         if p.name().lower() in ROBLOX_EXE_NAMES:
                             pid_running = True
+                            # Monitor RAM usage di background
+                            ram_usage = get_process_ram_usage(pid)
                         else:
                             pid_running = False
                     except Exception:
@@ -489,6 +543,16 @@ def main():
                     acc["online_count"] = 0
                     acc["offline_count"] = 0
                     status_msg = "In Game"
+                    
+                    # Jika tidak ada PID tapi status InGame, coba cari proses yang cocok
+                    if not pid_running:
+                        # Cari proses Roblox yang berjalan
+                        current_roblox_pids = list_current_roblox_pids()
+                        if current_roblox_pids:
+                            # Ambil PID terbaru
+                            newest_pid = max(current_roblox_pids.items(), key=lambda x: x[1])[0]
+                            acc["pid"] = newest_pid
+                            log(f"Auto-matched PID {newest_pid} to {name} (InGame status)")
 
                 else:
                     status_msg = "Unknown"
@@ -539,6 +603,8 @@ def main():
                     status_text.stylize("bold blue")
                 elif "Offline" in status_msg:
                     status_text.stylize("bold red")
+                elif "Launched" in status_msg:
+                    status_text.stylize("bold green")
                 else:
                     status_text.stylize("bold yellow")
 
@@ -550,8 +616,6 @@ def main():
             # Set flag first_iteration menjadi False setelah iterasi pertama selesai
             if first_iteration:
                 first_iteration = False
-                # Clear screen setelah iterasi pertama selesai
-                console.clear()
 
             # arrange windows if enabled
             if cfg.get("ArrangeWindows", True):
@@ -561,6 +625,10 @@ def main():
             time.sleep(float(cfg.get("checkInterval", 10)))
 
 if __name__ == "__main__":
-    log("Starting Roblox Auto Rejoin Monitor (cookies.txt mode)")
-
-    main()
+    try:
+        log("Starting Roblox Auto Rejoin Monitor (cookies.txt mode)")
+        main()
+    except KeyboardInterrupt:
+        log("Program dihentikan oleh user")
+    except Exception as e:
+        log(f"Error: {e}")
