@@ -4,7 +4,6 @@ import json
 import requests
 import subprocess
 import psutil
-import threading
 from datetime import datetime
 from rich.table import Table
 from rich.console import Console
@@ -24,9 +23,7 @@ console = Console()
 # Default config (merged into existing config if needed)
 DEFAULT_CONFIG = {
     "gameId": 2753915549,
-    "checkInterval": 60,  # Default lebih lama untuk hindari rate limit
-    "presenceCheckInterval": 30,  # Interval khusus untuk cek presence
-    "processCheckInterval": 10,   # Interval khusus untuk cek process
+    "checkInterval": 10,
     "maxOnlineChecks": 3,
     "maxOfflineChecks": 3,
     "launchDelay": 15,
@@ -43,11 +40,6 @@ DEFAULT_CONFIG = {
 
 # Roblox exe names to detect
 ROBLOX_EXE_NAMES = {"robloxplayerbeta.exe", "robloxplayer.exe", "robloxplayerlauncher.exe"}
-
-# Global locks untuk prevent race condition
-process_lock = threading.Lock()
-restart_lock = threading.Lock()
-presence_lock = threading.Lock()
 
 # ----------------------------
 # Helpers / Logging
@@ -156,41 +148,40 @@ def get_process_ram_usage(pid):
 
 def check_and_kill_high_ram_processes(accounts, ram_threshold_gb, launch_delay, cfg_game_id):
     """Memeriksa dan mengkill process yang menggunakan RAM melebihi threshold, lalu restart"""
-    with process_lock:
-        killed_accounts = []
-        
-        for acc in accounts:
-            pid = acc.get("pid")
-            if pid:
-                ram_usage = get_process_ram_usage(pid)
-                if ram_usage > ram_threshold_gb:
-                    log(f"{acc['username']} menggunakan {ram_usage}GB RAM (> {ram_threshold_gb}GB) -> killing process")
-                    if kill_pid(pid):
-                        acc["pid"] = None
-                        killed_accounts.append(acc)
-                        log(f"{acc['username']}: Process killed karena penggunaan RAM tinggi")
-                    else:
-                        log(f"{acc['username']}: Gagal kill process karena RAM tinggi")
-        
-        # Restart accounts yang di-kill dengan delay
-        if killed_accounts:
-            log(f"Restarting {len(killed_accounts)} accounts yang di-kill karena RAM tinggi")
-            
-            for i, acc in enumerate(killed_accounts):
-                if i > 0:
-                    # Delay untuk account selain yang pertama
-                    time.sleep(launch_delay)
-                
-                log(f"Restarting {acc['username']}...")
-                new_pid, reason = launch_via_protocol(acc["cookie"], cfg_game_id)
-                
-                if new_pid:
-                    acc["pid"] = new_pid
-                    log(f"{acc['username']}: Restarted dengan PID {new_pid}")
+    killed_accounts = []
+    
+    for acc in accounts:
+        pid = acc.get("pid")
+        if pid:
+            ram_usage = get_process_ram_usage(pid)
+            if ram_usage > ram_threshold_gb:
+                log(f"{acc['username']} menggunakan {ram_usage}GB RAM (> {ram_threshold_gb}GB) -> killing process")
+                if kill_pid(pid):
+                    acc["pid"] = None
+                    killed_accounts.append(acc)
+                    log(f"{acc['username']}: Process killed karena penggunaan RAM tinggi")
                 else:
-                    log(f"{acc['username']}: Restart failed ({reason})")
+                    log(f"{acc['username']}: Gagal kill process karena RAM tinggi")
+    
+    # Restart accounts yang di-kill dengan delay
+    if killed_accounts:
+        log(f"Restarting {len(killed_accounts)} accounts yang di-kill karena RAM tinggi")
         
-        return len(killed_accounts)
+        for i, acc in enumerate(killed_accounts):
+            if i > 0:
+                # Delay untuk account selain yang pertama
+                time.sleep(launch_delay)
+            
+            log(f"Restarting {acc['username']}...")
+            new_pid, reason = launch_via_protocol(acc["cookie"], cfg_game_id)
+            
+            if new_pid:
+                acc["pid"] = new_pid
+                log(f"{acc['username']}: Restarted dengan PID {new_pid}")
+            else:
+                log(f"{acc['username']}: Restart failed ({reason})")
+    
+    return len(killed_accounts)
 
 # ----------------------------
 # Roblox / API functions
@@ -209,20 +200,19 @@ def get_user_from_cookie(cookie):
     return None, None
 
 def get_presence(cookie, user_id):
-    with presence_lock:
-        try:
-            r = requests.post("https://presence.roblox.com/v1/presence/users",
-                              headers={"Cookie": f".ROBLOSECURITY={cookie}", "Content-Type": "application/json"},
-                              json={"userIds": [int(user_id)]},
-                              timeout=10)
-            if r.status_code == 200:
-                pres = r.json()["userPresences"][0]["userPresenceType"]
-                # 0=Offline,1=Online,2=InGame,3=InStudio
-                return int(pres)
-        except Exception as e:
-            # ignore
-            pass
-        return -1
+    try:
+        r = requests.post("https://presence.roblox.com/v1/presence/users",
+                          headers={"Cookie": f".ROBLOSECURITY={cookie}", "Content-Type": "application/json"},
+                          json={"userIds": [int(user_id)]},
+                          timeout=10)
+        if r.status_code == 200:
+            pres = r.json()["userPresences"][0]["userPresenceType"]
+            # 0=Offline,1=Online,2=InGame,3=InStudio
+            return int(pres)
+    except Exception as e:
+        # ignore
+        pass
+    return -1
 
 def get_auth_ticket(cookie):
     try:
@@ -252,15 +242,14 @@ def get_auth_ticket(cookie):
     return None
 
 def list_current_roblox_pids():
-    with process_lock:
-        res = []
-        for p in psutil.process_iter(['pid', 'name', 'create_time']):
-            try:
-                if p.info['name'] and p.info['name'].lower() in ROBLOX_EXE_NAMES:
-                    res.append((p.info['pid'], p.info.get('create_time', 0)))
-            except Exception:
-                pass
-        return dict(res)  # pid -> create_time
+    res = []
+    for p in psutil.process_iter(['pid', 'name', 'create_time']):
+        try:
+            if p.info['name'] and p.info['name'].lower() in ROBLOX_EXE_NAMES:
+                res.append((p.info['pid'], p.info.get('create_time', 0)))
+        except Exception:
+            pass
+    return dict(res)  # pid -> create_time
 
 def find_new_roblox_pid(before_pids, timeout=20):
     """Tunggu sampai ada pid baru yang bukan di before_pids. Return pid or None."""
@@ -276,15 +265,14 @@ def find_new_roblox_pid(before_pids, timeout=20):
     return None
 
 def kill_pid(pid):
-    with process_lock:
-        try:
-            if pid and psutil.pid_exists(pid):
-                p = psutil.Process(pid)
-                p.kill()
-                return True
-        except Exception:
-            pass
-        return False
+    try:
+        if pid and psutil.pid_exists(pid):
+            p = psutil.Process(pid)
+            p.kill()
+            return True
+    except Exception:
+        pass
+    return False
 
 def is_process_running(pid):
     """Cek apakah process dengan PID tertentu masih berjalan"""
@@ -310,118 +298,117 @@ def is_roblox_process_running(pid):
 # ----------------------------
 def launch_via_protocol(cookie, cfg_game_id):
     """Return new pid if found, otherwise None."""
-    with process_lock:
-        ticket = get_auth_ticket(cookie)
-        if not ticket:
-            return None, "no-ticket"
-        protocol = (
-            f"roblox-player:1+launchmode:play+gameinfo:{ticket}"
-            f"+launchtime:{int(time.time()*1000)}"
-            f"+placelauncherurl:https%3A%2F%2Fwww.roblox.com%2FGame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D{cfg_game_id}"
-        )
-        # capture current Roblox pids
-        before = list_current_roblox_pids()
-        try:
-            # start using start (let OS handle protocol)
-            subprocess.Popen(["cmd", "/c", "start", "", protocol], shell=True)
-        except Exception as e:
-            return None, "start-failed"
-        # find new pid
-        new_pid = find_new_roblox_pid(before, timeout=25)
-        if new_pid:
-            return new_pid, "ok"
-        return None, "no-new-pid"
+    ticket = get_auth_ticket(cookie)
+    if not ticket:
+        return None, "no-ticket"
+    protocol = (
+        f"roblox-player:1+launchmode:play+gameinfo:{ticket}"
+        f"+launchtime:{int(time.time()*1000)}"
+        f"+placelauncherurl:https%3A%2F%2Fwww.roblox.com%2FGame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D{cfg_game_id}"
+    )
+    # capture current Roblox pids
+    before = list_current_roblox_pids()
+    try:
+        # start using start (let OS handle protocol)
+        subprocess.Popen(["cmd", "/c", "start", "", protocol], shell=True)
+    except Exception as e:
+        return None, "start-failed"
+    # find new pid
+    new_pid = find_new_roblox_pid(before, timeout=25)
+    if new_pid:
+        return new_pid, "ok"
+    return None, "no-new-pid"
 
 # ----------------------------
-# Duplicate Account Detection - DIPERBAIKI
+# Duplicate Account Detection
 # ----------------------------
 def detect_and_kill_duplicate_accounts(accounts):
     """Deteksi dan kill proses untuk akun yang duplikat (username/cookie sama)"""
-    with process_lock:
-        killed_count = 0
-        
-        # Group accounts by username
-        username_groups = {}
-        for acc in accounts:
-            username = acc["username"]
-            if username not in username_groups:
-                username_groups[username] = []
-            username_groups[username].append(acc)
-        
-        # Untuk setiap grup username, jika ada lebih dari 1 account, keep yang terbaru
-        for username, acc_list in username_groups.items():
-            if len(acc_list) > 1:
-                log(f"Detected duplicate account: {username} ({len(acc_list)} instances)")
+    killed_count = 0
+    
+    # Group accounts by username
+    username_groups = {}
+    for acc in accounts:
+        username = acc["username"]
+        if username not in username_groups:
+            username_groups[username] = []
+        username_groups[username].append(acc)
+    
+    # Untuk setiap grup username, jika ada lebih dari 1 account, keep yang terbaru
+    for username, acc_list in username_groups.items():
+        if len(acc_list) > 1:
+            log(f"Detected duplicate account: {username} ({len(acc_list)} instances)")
+            
+            # Sort by PID (yang None dianggap lebih tua), lalu by online_count/offline_count
+            acc_list.sort(key=lambda x: (
+                x["pid"] is None,  # Yang tanpa PID dianggap lebih tua
+                -x.get("online_count", 0),  # Yang online_count lebih tinggi dianggap lebih baru
+                -x.get("offline_count", 0)  # Yang offline_count lebih tinggi dianggap lebih baru
+            ))
+            
+            # Keep the first one (yang dianggap terbaru), kill the rest
+            keep_acc = acc_list[0]
+            for acc in acc_list[1:]:
+                pid = acc.get("pid")
+                if pid and is_roblox_process_running(pid):
+                    if kill_pid(pid):
+                        log(f"Killed duplicate process PID {pid} for {username}")
+                        killed_count += 1
+                    else:
+                        log(f"Failed to kill duplicate process PID {pid} for {username}")
                 
-                # Filter hanya yang memiliki PID aktif
-                active_accounts = [acc for acc in acc_list if acc.get("pid") and is_roblox_process_running(acc["pid"])]
-                
-                if len(active_accounts) > 1:
-                    # Sort by create time (process yang lebih baru dipertahankan)
-                    active_accounts.sort(key=lambda x: psutil.Process(x["pid"]).create_time(), reverse=True)
-                    
-                    # Keep the first one (yang paling baru), kill the rest
-                    keep_acc = active_accounts[0]
-                    for acc in active_accounts[1:]:
-                        pid = acc.get("pid")
-                        if pid and is_roblox_process_running(pid):
-                            if kill_pid(pid):
-                                log(f"Killed duplicate process PID {pid} for {username}")
-                                killed_count += 1
-                                acc["pid"] = None
-                                acc["online_count"] = 0
-                                acc["offline_count"] = 0
-                                acc["unknown_count"] = 0
-                            else:
-                                log(f"Failed to kill duplicate process PID {pid} for {username}")
-        
-        return killed_count
+                # Reset the duplicate account
+                acc["pid"] = None
+                acc["online_count"] = 0
+                acc["offline_count"] = 0
+                acc["unknown_count"] = 0
+    
+    return killed_count
 
 # ----------------------------
 # Match existing Roblox processes to accounts
 # ----------------------------
 def match_existing_processes_to_accounts(accounts):
     """Mencocokkan proses Roblox yang sudah berjalan dengan akun berdasarkan cookie"""
-    with process_lock:
-        log("Mencari proses Roblox yang sudah berjalan...")
-        
-        # Dapatkan semua proses Roblox yang sedang berjalan
-        roblox_processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'create_time', 'memory_info']):
-            try:
-                if proc.info['name'] and proc.info['name'].lower() in ROBLOX_EXE_NAMES:
-                    roblox_processes.append(proc)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        
-        log(f"Found {len(roblox_processes)} Roblox processes running")
-        
-        # Untuk setiap akun, coba cocokkan dengan proses yang ada
-        matched_count = 0
-        for acc in accounts:
-            if acc.get("pid") is not None:
-                continue  # Skip jika sudah ada PID
-                
-            # Cek status presence untuk menentukan apakah akun sedang dalam game
-            presence = get_presence(acc["cookie"], acc["user_id"])
+    log("Mencari proses Roblox yang sudah berjalan...")
+    
+    # Dapatkan semua proses Roblox yang sedang berjalan
+    roblox_processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'create_time', 'memory_info']):
+        try:
+            if proc.info['name'] and proc.info['name'].lower() in ROBLOX_EXE_NAMES:
+                roblox_processes.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    log(f"Found {len(roblox_processes)} Roblox processes running")
+    
+    # Untuk setiap akun, coba cocokkan dengan proses yang ada
+    matched_count = 0
+    for acc in accounts:
+        if acc.get("pid") is not None:
+            continue  # Skip jika sudah ada PID
             
-            if presence == 2:  # InGame - kemungkinan besar ada proses yang berjalan
-                # Cari proses Roblox yang paling baru
-                if roblox_processes:
-                    # Urutkan berdasarkan waktu pembuatan (terbaru pertama)
-                    roblox_processes.sort(key=lambda p: p.info['create_time'], reverse=True)
-                    
-                    # Ambil proses terbaru dan assign ke akun ini
-                    newest_proc = roblox_processes[0]
-                    acc["pid"] = newest_proc.info['pid']
-                    matched_count += 1
-                    log(f"Matched existing process PID {newest_proc.info['pid']} to {acc['username']}")
-                    
-                    # Hapus proses yang sudah dipakai dari list
-                    roblox_processes.pop(0)
+        # Cek status presence untuk menentukan apakah akun sedang dalam game
+        presence = get_presence(acc["cookie"], acc["user_id"])
         
-        log(f"Berhasil mencocokkan {matched_count} proses yang sudah berjalan")
-        return matched_count
+        if presence == 2:  # InGame - kemungkinan besar ada proses yang berjalan
+            # Cari proses Roblox yang paling baru
+            if roblox_processes:
+                # Urutkan berdasarkan waktu pembuatan (terbaru pertama)
+                roblox_processes.sort(key=lambda p: p.info['create_time'], reverse=True)
+                
+                # Ambil proses terbaru dan assign ke akun ini
+                newest_proc = roblox_processes[0]
+                acc["pid"] = newest_proc.info['pid']
+                matched_count += 1
+                log(f"Matched existing process PID {newest_proc.info['pid']} to {acc['username']}")
+                
+                # Hapus proses yang sudah dipakai dari list
+                roblox_processes.pop(0)
+    
+    log(f"Berhasil mencocokkan {matched_count} proses yang sudah berjalan")
+    return matched_count
 
 # ----------------------------
 # Arrange windows by pid mapping
@@ -471,138 +458,118 @@ def arrange_windows_for_pids(pid_ordered_list, config):
         pass  # ignore arrangement errors
 
 # ----------------------------
-# Presence Checking Function - TERPISAH
-# ----------------------------
-def check_presence_for_accounts(accounts, config):
-    """Fungsi terpisah untuk cek presence dengan interval sendiri"""
-    with presence_lock:
-        for acc in accounts:
-            presence = get_presence(acc["cookie"], acc["user_id"])
-            
-            # Update counters berdasarkan status
-            if presence == 0:  # Offline
-                acc["offline_count"] += 1
-                acc["online_count"] = 0
-                acc["unknown_count"] = 0
-            elif presence == 1:  # Online
-                acc["online_count"] += 1
-                acc["offline_count"] = 0
-                acc["unknown_count"] = 0
-            elif presence == 2:  # InGame - reset semua counter
-                acc["online_count"] = 0
-                acc["offline_count"] = 0
-                acc["unknown_count"] = 0
-            else:  # Unknown/Error
-                acc["unknown_count"] += 1
-                acc["online_count"] = 0
-                acc["offline_count"] = 0
-
-# ----------------------------
-# Process Checking Function - TERPISAH
-# ----------------------------
-def check_processes_for_accounts(accounts):
-    """Fungsi terpisah untuk cek status process dengan interval sendiri"""
-    with process_lock:
-        for acc in accounts:
-            pid = acc.get("pid")
-            if pid:
-                # Cek apakah process masih berjalan
-                if not is_roblox_process_running(pid):
-                    acc["pid"] = None
-                    # Jika process mati, increment offline count
-                    acc["offline_count"] += 1
-
-# ----------------------------
-# Auto Restart Logic - DIPERBAIKI dengan lock
+# Auto Restart Logic - DIPERBAIKI
 # ----------------------------
 def check_and_restart_offline_accounts(accounts, config, last_launch_time, launch_delay):
     """Cek dan restart akun sesuai logika yang diperbaiki"""
-    with restart_lock:
-        restart_count = 0
+    restart_count = 0
+    
+    for acc in accounts:
+        pid = acc.get("pid")
+        cookie = acc["cookie"]
+        user_id = acc["user_id"]
+        username = acc["username"]
         
-        for acc in accounts:
-            pid = acc.get("pid")
-            cookie = acc["cookie"]
-            user_id = acc["user_id"]
-            username = acc["username"]
+        # Cek apakah process Roblox masih berjalan
+        process_running = is_roblox_process_running(pid)
+        
+        # Cek status presence
+        presence = get_presence(cookie, user_id)
+        
+        # Update counters berdasarkan status
+        if presence == 0:  # Offline
+            acc["offline_count"] += 1
+            acc["online_count"] = 0
+            acc["unknown_count"] = 0
+        elif presence == 1:  # Online
+            acc["online_count"] += 1
+            acc["offline_count"] = 0
+            acc["unknown_count"] = 0
+        elif presence == 2:  # InGame - reset semua counter
+            acc["online_count"] = 0
+            acc["offline_count"] = 0
+            acc["unknown_count"] = 0
+        else:  # Unknown/Error
+            acc["unknown_count"] += 1
+            acc["online_count"] = 0
+            acc["offline_count"] = 0
+        
+        # LOGICA UTAMA YANG DIPERBAIKI:
+        needs_restart = False
+        reason = ""
+        
+        # 1. Jika status InGame (2) - BIARKAN, jangan restart
+        if presence == 2:
+            # InGame adalah status ideal, tidak perlu restart
+            continue
+        
+        # 2. Process tidak berjalan -> status dianggap Offline
+        if not process_running:
+            # Jika process tidak berjalan, status dianggap Offline
+            needs_restart = True
+            reason = "Process tidak berjalan (Offline)"
             
-            # Cek apakah process Roblox masih berjalan
-            process_running = is_roblox_process_running(pid)
-            
-            # LOGICA UTAMA YANG DIPERBAIKI:
-            needs_restart = False
-            reason = ""
-            
-            # 1. Jika status InGame (2) - BIARKAN, jangan restart
-            if acc.get("last_presence") == 2:
-                continue
-            
-            # 2. Process tidak berjalan -> status dianggap Offline
-            if not process_running:
+            # Gunakan offline_count untuk threshold checking
+            if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
                 needs_restart = True
-                reason = "Process tidak berjalan (Offline)"
-                
-                # Gunakan offline_count untuk threshold checking
-                if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
-                    needs_restart = True
-                    reason = f"Offline count {acc['offline_count']} mencapai threshold"
-            
-            # 3. Process berjalan tapi status Online - cek threshold
-            elif process_running and acc.get("last_presence") == 1:
-                if acc["online_count"] >= int(config.get("maxOnlineChecks", 3)):
-                    needs_restart = True
-                    reason = f"Online count {acc['online_count']} mencapai threshold"
-            
-            # 4. Process berjalan tapi status Offline - cek threshold
-            elif process_running and acc.get("last_presence") == 0:
-                if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
-                    needs_restart = True
-                    reason = f"Offline count {acc['offline_count']} mencapai threshold"
-            
-            # 5. Process berjalan tapi status Unknown/Error - cek threshold
-            elif process_running and acc.get("last_presence") == -1:
-                if acc["unknown_count"] >= int(config.get("maxOnlineChecks", 3)):
-                    needs_restart = True
-                    reason = f"Unknown count {acc['unknown_count']} mencapai threshold"
-            
-            # Eksekusi restart jika diperlukan
-            if needs_restart and config.get("AutoRestart", True):
-                # Apply launch delay
-                current_time = time.time()
-                time_since_last_launch = current_time - last_launch_time[0]
-                
-                if time_since_last_launch < launch_delay:
-                    wait_time = launch_delay - time_since_last_launch
-                    time.sleep(wait_time)
-                
-                # Kill process lama jika masih ada
-                if pid and is_process_running(pid):
-                    log(f"{username}: Killing process PID {pid} ({reason})")
-                    kill_pid(pid)
-                    time.sleep(2)  # Beri waktu lebih untuk process benar-benar terminate
-                
-                # Launch process baru sesuai username dan cookie
-                log(f"{username}: {reason} -> restarting...")
-                new_pid, launch_reason = launch_via_protocol(cookie, config.get("gameId"))
-                last_launch_time[0] = time.time()
-                
-                if new_pid:
-                    acc["pid"] = new_pid
-                    acc["online_count"] = 0
-                    acc["offline_count"] = 0
-                    acc["unknown_count"] = 0
-                    log(f"{username}: Berhasil restart dengan PID {new_pid}")
-                    restart_count += 1
-                else:
-                    log(f"{username}: Gagal restart ({launch_reason})")
-                
-                # Additional delay between restarts
-                time.sleep(float(config.get("RestartDelay", 5)))
+                reason = f"Offline count {acc['offline_count']} mencapai threshold"
         
-        return restart_count
+        # 3. Process berjalan tapi status Online - cek threshold
+        elif process_running and presence == 1:
+            if acc["online_count"] >= int(config.get("maxOnlineChecks", 3)):
+                needs_restart = True
+                reason = f"Online count {acc['online_count']} mencapai threshold"
+        
+        # 4. Process berjalan tapi status Offline - cek threshold
+        elif process_running and presence == 0:
+            if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
+                needs_restart = True
+                reason = f"Offline count {acc['offline_count']} mencapai threshold"
+        
+        # 5. Process berjalan tapi status Unknown/Error - cek threshold
+        elif process_running and presence == -1:
+            if acc["unknown_count"] >= int(config.get("maxOnlineChecks", 3)):  # Gunakan maxOnlineChecks untuk unknown
+                needs_restart = True
+                reason = f"Unknown count {acc['unknown_count']} mencapai threshold"
+        
+        # Eksekusi restart jika diperlukan
+        if needs_restart and config.get("AutoRestart", True):
+            # Apply launch delay
+            current_time = time.time()
+            time_since_last_launch = current_time - last_launch_time[0]
+            
+            if time_since_last_launch < launch_delay:
+                wait_time = launch_delay - time_since_last_launch
+                time.sleep(wait_time)
+            
+            # Kill process lama jika masih ada
+            if pid and is_process_running(pid):
+                log(f"{username}: Killing process PID {pid} ({reason})")
+                kill_pid(pid)
+                time.sleep(1)
+            
+            # Launch process baru sesuai username dan cookie
+            log(f"{username}: {reason} -> restarting...")
+            new_pid, launch_reason = launch_via_protocol(cookie, config.get("gameId"))
+            last_launch_time[0] = time.time()
+            
+            if new_pid:
+                acc["pid"] = new_pid
+                acc["online_count"] = 0
+                acc["offline_count"] = 0
+                acc["unknown_count"] = 0
+                log(f"{username}: Berhasil restart dengan PID {new_pid}")
+                restart_count += 1
+            else:
+                log(f"{username}: Gagal restart ({launch_reason})")
+            
+            # Additional delay between restarts
+            time.sleep(float(config.get("RestartDelay", 5)))
+    
+    return restart_count
 
 # ----------------------------
-# Main logic - DIPERBAIKI dengan timing terpisah
+# Main logic
 # ----------------------------
 def main():
     cfg = load_or_create_config()
@@ -629,8 +596,6 @@ def main():
                 "online_count": 0,
                 "offline_count": 0,
                 "unknown_count": 0,
-                "last_presence": -1,
-                "last_checked": 0
             })
             log(f"Loaded {uname} ({uid})")
         else:
@@ -652,78 +617,65 @@ def main():
     # Mencocokkan proses yang sudah berjalan dengan akun
     match_existing_processes_to_accounts(accounts)
 
-    # Variables untuk mengontrol delay
-    last_launch_time = [time.time()]
-    last_presence_check = time.time()
-    last_process_check = time.time()
-    last_duplicate_check = time.time()
-    last_ram_check = time.time()
+    # Variables untuk mengontrol delay antar peluncuran
+    last_launch_time = [time.time()]  # Gunakan list untuk mutable reference
+    launch_delay = float(cfg.get("launchDelay", 15))
+    check_interval = float(cfg.get("checkInterval", 10))
 
-    # Get intervals from config
-    check_interval = float(cfg.get("checkInterval", 60))
-    presence_interval = float(cfg.get("presenceCheckInterval", 30))
-    process_interval = float(cfg.get("processCheckInterval", 10))
-    duplicate_interval = 60  # Check duplicates every 60 seconds
-    ram_interval = 30  # Check RAM every 30 seconds
+    # Flag untuk menandai apakah ini adalah iterasi pertama
+    first_iteration = True
 
     # Clear screen sebelum memulai live table
     console.clear()
 
+    # live table - tanpa batasan baris
     with Live(refresh_per_second=4, console=console, screen=False) as live:
         while True:
-            current_time = time.time()
-            
-            # Check for duplicate accounts (setiap 60 detik)
-            if current_time - last_duplicate_check >= duplicate_interval:
-                killed_duplicates = detect_and_kill_duplicate_accounts(accounts)
-                if killed_duplicates > 0:
-                    log(f"Killed {killed_duplicates} duplicate account processes")
-                last_duplicate_check = current_time
-            
-            # Check RAM usage (setiap 30 detik)
-            if current_time - last_ram_check >= ram_interval and cfg.get("Kill Process > Ram", False):
+            # Deteksi dan kill duplicate accounts
+            killed_duplicates = detect_and_kill_duplicate_accounts(accounts)
+            if killed_duplicates > 0:
+                log(f"Killed {killed_duplicates} duplicate account processes")
+
+            # Check RAM usage and kill processes if enabled
+            if cfg.get("Kill Process > Ram", False):
                 ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
-                killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, 
-                                                               float(cfg.get("launchDelay", 15)), 
-                                                               cfg.get("gameId"))
+                killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, launch_delay, cfg.get("gameId"))
                 if killed_count > 0:
                     log(f"Restarted {killed_count} processes karena penggunaan RAM tinggi")
-                last_ram_check = current_time
-            
-            # Check presence (setiap presence_interval detik)
-            if current_time - last_presence_check >= presence_interval:
-                check_presence_for_accounts(accounts, cfg)
-                last_presence_check = current_time
-            
-            # Check processes (setiap process_interval detik)
-            if current_time - last_process_check >= process_interval:
-                check_processes_for_accounts(accounts)
-                last_process_check = current_time
-            
-            # Auto restart logic (menggunakan data dari presence dan process checks)
+
+            # Check and restart offline/killed processes sesuai logika baru
             if cfg.get("AutoRestart", True):
-                restart_count = check_and_restart_offline_accounts(accounts, cfg, last_launch_time, 
-                                                                 float(cfg.get("launchDelay", 15)))
-                if restart_count > 0:
+                restart_count = check_and_restart_offline_accounts(accounts, cfg, last_launch_time, launch_delay)
+                if restart_count > 0 and first_iteration:
                     log(f"Auto-restarted {restart_count} accounts sesuai threshold config")
 
-            # Update display table
+            # For arranging windows later, collect pid order list
             pid_order = []
+
             table = Table(title="Roblox Auto Rejoin Monitor", show_header=True, header_style="bold magenta")
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
             table.add_column("Status", width=45)
 
+            # iterate accounts and update
             for i, acc in enumerate(accounts, start=1):
-                name = acc["username"]
+                cookie = acc["cookie"]
                 uid = acc["user_id"]
+                name = acc["username"]
                 pid = acc.get("pid")
-                presence = acc.get("last_presence", -1)
-                
+
+                presence = get_presence(cookie, uid)
+
+                # check if pid still exists and is Roblox process
                 pid_running = is_roblox_process_running(pid)
-                
-                # Status message
+
+                # Update PID status jika process mati
+                if not pid_running and pid is not None:
+                    acc["pid"] = None
+                    pid = None
+
+                # Status message dengan informasi counter yang sesuai
                 status_msg = ""
                 if presence == 2:  # InGame
                     status_msg = "In Game ✅"
@@ -743,13 +695,14 @@ def main():
                     else:
                         status_msg = f"Unknown [{acc['unknown_count']}/{cfg.get('maxOnlineChecks',3)}]"
 
+                # append pid to pid_order for arranging windows
                 pid_order.append(pid)
 
-                # Color coding
+                # Buat teks dengan warna yang sesuai
                 username_text = Text(name)
                 status_text = Text(status_msg)
                 
-                if presence == 2:  # InGame - hijau
+                if presence == 2:  # InGame - hijau (ideal)
                     username_text.stylize("bold green")
                     status_text.stylize("bold green")
                 elif presence == 1:  # Online - biru
@@ -762,21 +715,33 @@ def main():
                     username_text.stylize("bold yellow")
                     status_text.stylize("bold yellow")
 
+                # Highlight jika perlu restart (mendekati threshold)
+                if (presence == 1 and acc["online_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1) or \
+                   (presence == 0 and acc["offline_count"] >= int(cfg.get("maxOfflineChecks", 3)) - 1) or \
+                   (presence == -1 and acc["unknown_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1):
+                    status_text.stylize("bold magenta")
+
+                # Tambah row ke table
                 table.add_row(str(i), username_text, str(uid), status_text)
 
+            # Update live table
             live.update(table)
 
-            # Arrange windows if enabled
+            # Set flag first_iteration menjadi False setelah iterasi pertama selesai
+            if first_iteration:
+                first_iteration = False
+
+            # arrange windows if enabled
             if cfg.get("ArrangeWindows", True):
                 arrange_windows_for_pids(pid_order, cfg)
 
-            # Wait for next cycle sesuai checkInterval utama
+            # Wait for next cycle sesuai checkInterval dari config
             time.sleep(check_interval)
 
 if __name__ == "__main__":
     try:
-        log("Starting Roblox Auto Rejoin Monitor (Improved Timing & Locking)")
-        log("Fitur: Interval terpisah untuk presence, process, dan duplicate checks")
+        log("Starting Roblox Auto Rejoin Monitor (Logic Improved)")
+        log("Fitur: Status InGame tidak di-restart, threshold checking sesuai config")
         main()
     except KeyboardInterrupt:
         log("Program dihentikan oleh user")
