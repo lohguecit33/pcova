@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "maxOnlineChecks": 3,
     "maxOfflineChecks": 3,
     "launchDelay": 15,
+    "accountLaunchCooldown": 30,      # jeda khusus tiap akun (mencegah double launch)
     "TotalInstance": 10,
     "WindowsPerRow": 3,
     "FixedSize": "530x400",
@@ -163,6 +164,8 @@ def check_and_kill_high_ram_processes(accounts, ram_threshold_gb):
                     acc["offline_count"] = 0
                     acc["online_count"] = 0
                     acc["unknown_count"] = 0
+                    acc.setdefault("last_launch", 0)      # waktu terakhir launch
+                    acc.setdefault("launching", False)    # status sedang launching
                     killed_accounts.append(acc)
                     log(f"{acc['username']}: Process killed karena penggunaan RAM tinggi")
                 else:
@@ -465,7 +468,7 @@ def proc_cycle(accounts, cfg, last_launch_time):
         ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
         killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold)
         if killed_count > 0:
-            log(f"Killed {killed_count} processes karena penggunaan RAM tinggi (tidak di-restart di sini)")
+            log(f"Killed {killed_count} processes karena penggunaan RAM tinggi ")
 
     # 3) Untuk tiap akun, cek process existence + presence, dan jika process tidak berjalan & presence==Offline -> langsung launch
     for acc in accounts:
@@ -487,24 +490,29 @@ def proc_cycle(accounts, cfg, last_launch_time):
         # Jika process tidak berjalan DAN presence == Offline (0) -> langsung launch tanpa menunggu threshold
         # Juga: jika process tidak berjalan dan presence != InGame (2) -> kita juga bisa coba launch (safety)
         if not pid and (presence == 0 or presence == -1 or presence == 1):
-            # immediate start because user requested: jika apk/pid/roblox tidak berjalan dan status offline -> langsung jalankan
-            if presence == 0 or presence == -1:
-                log(f"{name}: Process tidak berjalan & presence={presence} -> langsung launching")
-            else:
-                # presence == 1 tetapi pid tidak ada: juga coba start because process missing
-                log(f"{name}: PID hilang tapi presence={presence} -> mencoba launching")
-
-            # small optional pacing: ensure we don't launch too fast multiple times; gunakan launchDelay antar-launch global
             now = time.time()
-            if now - last_launch_time[0] < float(cfg.get("launchDelay", 15)):
-                # Jika terlalu cepat, tunda sedikit agar tidak spam
-                wait = float(cfg.get("launchDelay", 15)) - (now - last_launch_time[0])
-                log(f"Menunggu {round(wait,1)}s untuk mencegah spam launch (launchDelay config)")
-                time.sleep(wait)
 
-            before = list_current_roblox_pids()
+            # cek cooldown per akun
+            if now - acc.get("last_launch", 0) < float(cfg.get("accountLaunchCooldown", 30)):
+                continue  # skip kalau masih cooldown
+
+            if presence == 0 or presence == -1:
+                log(f"{name}: akun offline & presence={presence} -> launching")
+            else:
+                log(f"{name}: PID hilang tapi presence={presence} -> launching")
+            
+
+            # cek global launchDelay
+            if now - last_launch_time[0] < float(cfg.get("launchDelay", 15)):
+               wait = float(cfg.get("launchDelay", 15)) - (now - last_launch_time[0])
+               log(f"Menunggu {round(wait,1)}s  launch delay (launchDelay config)")
+               time.sleep(wait)
+
             new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
             last_launch_time[0] = time.time()
+            acc["last_launch"] = time.time()
+            acc["launching"] = False
+
             if new_pid:
                 acc["pid"] = new_pid
                 acc["online_count"] = 0
