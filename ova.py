@@ -361,6 +361,7 @@ def detect_and_kill_duplicate_accounts(accounts):
                 acc["pid"] = None
                 acc["online_count"] = 0
                 acc["offline_count"] = 0
+                acc["unknown_count"] = 0
     
     return killed_count
 
@@ -457,10 +458,10 @@ def arrange_windows_for_pids(pid_ordered_list, config):
         pass  # ignore arrangement errors
 
 # ----------------------------
-# Auto Restart Logic
+# Auto Restart Logic - DIPERBAIKI
 # ----------------------------
 def check_and_restart_offline_accounts(accounts, config, last_launch_time, launch_delay):
-    """Cek dan restart akun yang offline atau processnya mati"""
+    """Cek dan restart akun sesuai logika yang diperbaiki"""
     restart_count = 0
     
     for acc in accounts:
@@ -469,7 +470,7 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
         user_id = acc["user_id"]
         username = acc["username"]
         
-        # Cek apakah process masih berjalan
+        # Cek apakah process Roblox masih berjalan
         process_running = is_roblox_process_running(pid)
         
         # Cek status presence
@@ -479,39 +480,59 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
         if presence == 0:  # Offline
             acc["offline_count"] += 1
             acc["online_count"] = 0
+            acc["unknown_count"] = 0
         elif presence == 1:  # Online
             acc["online_count"] += 1
             acc["offline_count"] = 0
-        else:  # InGame, Unknown, dll
+            acc["unknown_count"] = 0
+        elif presence == 2:  # InGame - reset semua counter
+            acc["online_count"] = 0
+            acc["offline_count"] = 0
+            acc["unknown_count"] = 0
+        else:  # Unknown/Error
+            acc["unknown_count"] += 1
             acc["online_count"] = 0
             acc["offline_count"] = 0
         
-        # Kondisi untuk restart:
-        # 1. Process tidak berjalan DAN status offline
-        # 2. Process tidak berjalan DAN status unknown/error
-        # 3. Process berjalan TAPI status offline (process zombie/hang)
-        # 4. Offline count mencapai threshold
-        # 5. Online count mencapai threshold
-        
+        # LOGICA UTAMA YANG DIPERBAIKI:
         needs_restart = False
         reason = ""
         
-        if not process_running and presence in [0, -1]:  # Offline atau unknown
-            needs_restart = True
-            reason = f"Process tidak berjalan dan status {['Offline','Unknown'][presence == -1]}"
-        elif not process_running:  # Process mati tapi status online/in-game (inconsistency)
-            needs_restart = True
-            reason = "Process tidak berjalan (status inconsistency)"
-        elif process_running and presence == 0:  # Process berjalan tapi status offline
-            needs_restart = True
-            reason = "Process berjalan tapi status Offline (zombie process)"
-        elif acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
-            needs_restart = True
-            reason = f"Offline count {acc['offline_count']} mencapai threshold"
-        elif acc["online_count"] >= int(config.get("maxOnlineChecks", 3)):
-            needs_restart = True
-            reason = f"Online count {acc['online_count']} mencapai threshold"
+        # 1. Jika status InGame (2) - BIARKAN, jangan restart
+        if presence == 2:
+            # InGame adalah status ideal, tidak perlu restart
+            continue
         
+        # 2. Process tidak berjalan -> status dianggap Offline
+        if not process_running:
+            # Jika process tidak berjalan, status dianggap Offline
+            needs_restart = True
+            reason = "Process tidak berjalan (Offline)"
+            
+            # Gunakan offline_count untuk threshold checking
+            if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
+                needs_restart = True
+                reason = f"Offline count {acc['offline_count']} mencapai threshold"
+        
+        # 3. Process berjalan tapi status Online - cek threshold
+        elif process_running and presence == 1:
+            if acc["online_count"] >= int(config.get("maxOnlineChecks", 3)):
+                needs_restart = True
+                reason = f"Online count {acc['online_count']} mencapai threshold"
+        
+        # 4. Process berjalan tapi status Offline - cek threshold
+        elif process_running and presence == 0:
+            if acc["offline_count"] >= int(config.get("maxOfflineChecks", 3)):
+                needs_restart = True
+                reason = f"Offline count {acc['offline_count']} mencapai threshold"
+        
+        # 5. Process berjalan tapi status Unknown/Error - cek threshold
+        elif process_running and presence == -1:
+            if acc["unknown_count"] >= int(config.get("maxOnlineChecks", 3)):  # Gunakan maxOnlineChecks untuk unknown
+                needs_restart = True
+                reason = f"Unknown count {acc['unknown_count']} mencapai threshold"
+        
+        # Eksekusi restart jika diperlukan
         if needs_restart and config.get("AutoRestart", True):
             # Apply launch delay
             current_time = time.time()
@@ -523,10 +544,11 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
             
             # Kill process lama jika masih ada
             if pid and is_process_running(pid):
+                log(f"{username}: Killing process PID {pid} ({reason})")
                 kill_pid(pid)
                 time.sleep(1)
             
-            # Launch process baru
+            # Launch process baru sesuai username dan cookie
             log(f"{username}: {reason} -> restarting...")
             new_pid, launch_reason = launch_via_protocol(cookie, config.get("gameId"))
             last_launch_time[0] = time.time()
@@ -535,6 +557,7 @@ def check_and_restart_offline_accounts(accounts, config, last_launch_time, launc
                 acc["pid"] = new_pid
                 acc["online_count"] = 0
                 acc["offline_count"] = 0
+                acc["unknown_count"] = 0
                 log(f"{username}: Berhasil restart dengan PID {new_pid}")
                 restart_count += 1
             else:
@@ -572,7 +595,7 @@ def main():
                 "pid": None,
                 "online_count": 0,
                 "offline_count": 0,
-                "error_count": 0,
+                "unknown_count": 0,
             })
             log(f"Loaded {uname} ({uid})")
         else:
@@ -597,6 +620,7 @@ def main():
     # Variables untuk mengontrol delay antar peluncuran
     last_launch_time = [time.time()]  # Gunakan list untuk mutable reference
     launch_delay = float(cfg.get("launchDelay", 15))
+    check_interval = float(cfg.get("checkInterval", 10))
 
     # Flag untuk menandai apakah ini adalah iterasi pertama
     first_iteration = True
@@ -612,18 +636,18 @@ def main():
             if killed_duplicates > 0:
                 log(f"Killed {killed_duplicates} duplicate account processes")
 
-            # Check RAM usage and kill processes if enabled (berjalan di background)
+            # Check RAM usage and kill processes if enabled
             if cfg.get("Kill Process > Ram", False):
                 ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
                 killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold, launch_delay, cfg.get("gameId"))
                 if killed_count > 0:
                     log(f"Restarted {killed_count} processes karena penggunaan RAM tinggi")
 
-            # Check and restart offline/killed processes
+            # Check and restart offline/killed processes sesuai logika baru
             if cfg.get("AutoRestart", True):
                 restart_count = check_and_restart_offline_accounts(accounts, cfg, last_launch_time, launch_delay)
                 if restart_count > 0 and first_iteration:
-                    log(f"Auto-restarted {restart_count} accounts yang offline/process killed")
+                    log(f"Auto-restarted {restart_count} accounts sesuai threshold config")
 
             # For arranging windows later, collect pid order list
             pid_order = []
@@ -632,7 +656,7 @@ def main():
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("Status", width=40)
+            table.add_column("Status", width=45)
 
             # iterate accounts and update
             for i, acc in enumerate(accounts, start=1):
@@ -643,10 +667,6 @@ def main():
 
                 presence = get_presence(cookie, uid)
 
-                # normalize presence string
-                PRES_MAP = { -1: "Unknown", 0: "Offline", 1: "Online", 2: "InGame", 3: "InStudio" }
-                pres_str = PRES_MAP.get(presence, "Unknown")
-
                 # check if pid still exists and is Roblox process
                 pid_running = is_roblox_process_running(pid)
 
@@ -655,26 +675,25 @@ def main():
                     acc["pid"] = None
                     pid = None
 
-                # Status message dengan informasi counter
+                # Status message dengan informasi counter yang sesuai
                 status_msg = ""
-                if pid_running:
-                    if presence == 2:  # InGame
-                        status_msg = f"In Game (PID: {pid})"
-                    elif presence == 1:  # Online
-                        status_msg = f"Online [{acc['online_count']}/{cfg.get('maxOnlineChecks',3)}] (PID: {pid})"
-                    elif presence == 0:  # Offline - process running but status offline
-                        status_msg = f"Offline [{acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}] (Process Running)"
-                    else:  # Unknown
-                        status_msg = f"Unknown [{acc.get('error_count',0)}] (PID: {pid})"
-                else:
-                    if presence == 2:  # InGame but no process
-                        status_msg = "InGame (No Process - NEED RESTART)"
-                    elif presence == 1:  # Online but no process
+                if presence == 2:  # InGame
+                    status_msg = "In Game ✅"
+                elif presence == 1:  # Online
+                    if pid_running:
+                        status_msg = f"Online [{acc['online_count']}/{cfg.get('maxOnlineChecks',3)}]"
+                    else:
                         status_msg = f"Online [{acc['online_count']}/{cfg.get('maxOnlineChecks',3)}] (No Process)"
-                    elif presence == 0:  # Offline
+                elif presence == 0:  # Offline
+                    if pid_running:
+                        status_msg = f"Offline [{acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}] (Process Running)"
+                    else:
                         status_msg = f"Offline [{acc['offline_count']}/{cfg.get('maxOfflineChecks',3)}]"
-                    else:  # Unknown
-                        status_msg = f"Unknown [{acc.get('error_count',0)}]"
+                else:  # Unknown
+                    if pid_running:
+                        status_msg = f"Unknown [{acc['unknown_count']}/{cfg.get('maxOnlineChecks',3)}] (Process Running)"
+                    else:
+                        status_msg = f"Unknown [{acc['unknown_count']}/{cfg.get('maxOnlineChecks',3)}]"
 
                 # append pid to pid_order for arranging windows
                 pid_order.append(pid)
@@ -683,26 +702,24 @@ def main():
                 username_text = Text(name)
                 status_text = Text(status_msg)
                 
-                if pid_running:
-                    if presence == 2:  # InGame - hijau
-                        username_text.stylize("bold green")
-                        status_text.stylize("bold green")
-                    elif presence == 1:  # Online - biru
-                        username_text.stylize("bold blue")
-                        status_text.stylize("bold blue")
-                    else:  # Other status with running process - kuning
-                        username_text.stylize("bold yellow")
-                        status_text.stylize("bold yellow")
-                else:
-                    if presence == 0:  # Offline - merah
-                        username_text.stylize("bold red")
-                        status_text.stylize("bold red")
-                    elif presence in [1, 2]:  # Online/InGame but no process - magenta (urgent)
-                        username_text.stylize("bold magenta")
-                        status_text.stylize("bold magenta")
-                    else:  # Unknown/other - kuning
-                        username_text.stylize("bold yellow")
-                        status_text.stylize("bold yellow")
+                if presence == 2:  # InGame - hijau (ideal)
+                    username_text.stylize("bold green")
+                    status_text.stylize("bold green")
+                elif presence == 1:  # Online - biru
+                    username_text.stylize("bold blue")
+                    status_text.stylize("bold blue")
+                elif presence == 0:  # Offline - merah
+                    username_text.stylize("bold red")
+                    status_text.stylize("bold red")
+                else:  # Unknown - kuning
+                    username_text.stylize("bold yellow")
+                    status_text.stylize("bold yellow")
+
+                # Highlight jika perlu restart (mendekati threshold)
+                if (presence == 1 and acc["online_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1) or \
+                   (presence == 0 and acc["offline_count"] >= int(cfg.get("maxOfflineChecks", 3)) - 1) or \
+                   (presence == -1 and acc["unknown_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1):
+                    status_text.stylize("bold magenta")
 
                 # Tambah row ke table
                 table.add_row(str(i), username_text, str(uid), status_text)
@@ -718,13 +735,13 @@ def main():
             if cfg.get("ArrangeWindows", True):
                 arrange_windows_for_pids(pid_order, cfg)
 
-            # Wait for next cycle
-            time.sleep(float(cfg.get("checkInterval", 10)))
+            # Wait for next cycle sesuai checkInterval dari config
+            time.sleep(check_interval)
 
 if __name__ == "__main__":
     try:
-        log("Starting Roblox Auto Rejoin Monitor (Multi-Instance Support)")
-        log("Fitur: Auto-restart ketika process mati/offline & Duplicate account detection")
+        log("Starting Roblox Auto Rejoin Monitor (Logic Improved)")
+        log("Fitur: Status InGame tidak di-restart, threshold checking sesuai config")
         main()
     except KeyboardInterrupt:
         log("Program dihentikan oleh user")
