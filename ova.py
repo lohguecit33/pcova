@@ -469,6 +469,7 @@ def proc_cycle(accounts, cfg, last_launch_time):
         killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold)
         if killed_count > 0:
             log(f"Killed {killed_count} processes karena penggunaan RAM tinggi ")
+            console.clear()
 
     # 3) Untuk tiap akun, cek process existence + presence, dan jika process tidak berjalan & presence==Offline -> langsung launch
     for acc in accounts:
@@ -507,6 +508,7 @@ def proc_cycle(accounts, cfg, last_launch_time):
                wait = float(cfg.get("launchDelay", 15)) - (now - last_launch_time[0])
                log(f"Menunggu {round(wait,1)}s  launch delay (launchDelay config)")
                time.sleep(wait)
+               console.clear()
 
             new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
             last_launch_time[0] = time.time()
@@ -521,6 +523,7 @@ def proc_cycle(accounts, cfg, last_launch_time):
                 log(f"{name}: Berhasil launch -> PID {new_pid}")
             else:
                 log(f"{name}: Gagal launch ({reason})")
+                console.clear()
         # kalau pid ada dan jalan, nothing to do here (presence update dilakukan di presence loop)
         pid_order.append(acc.get("pid"))
 
@@ -556,6 +559,45 @@ def presence_cycle(accounts, cfg):
             acc["unknown_count"] += 1
             acc["online_count"] = 0
             acc["offline_count"] = 0
+
+def check_and_kill_max_checks(accounts, cfg):
+    """
+    Cek apakah counter presence (online/offline/unknown) sudah mencapai max.
+    Kalau ya, langsung kill PID (tanpa restart).
+    """
+    killed_accounts = []
+    max_online = int(cfg.get("maxOnlineChecks", 3))
+    max_offline = int(cfg.get("maxOfflineChecks", 3))
+    max_unknown = int(cfg.get("maxOnlineChecks", 3))  # Unknown ikut pakai maxOnlineChecks
+
+    for acc in accounts:
+        pid = acc.get("pid")
+        if pid and is_roblox_process_running(pid):
+            if acc["online_count"] >= max_online:
+                log(f"{acc['username']}: Online check max tercapai ({acc['online_count']}/{max_online}) -> killing process ONLY")
+                if kill_pid(pid):
+                    acc["pid"] = None
+                    acc["online_count"] = 0
+                    acc["offline_count"] = 0
+                    acc["unknown_count"] = 0
+                    killed_accounts.append(acc)
+            elif acc["offline_count"] >= max_offline:
+                log(f"{acc['username']}: Offline check max tercapai ({acc['offline_count']}/{max_offline}) -> killing process ONLY")
+                if kill_pid(pid):
+                    acc["pid"] = None
+                    acc["online_count"] = 0
+                    acc["offline_count"] = 0
+                    acc["unknown_count"] = 0
+                    killed_accounts.append(acc)
+            elif acc["unknown_count"] >= max_unknown:
+                log(f"{acc['username']}: Unknown check max tercapai ({acc['unknown_count']}/{max_unknown}) -> killing process ONLY")
+                if kill_pid(pid):
+                    acc["pid"] = None
+                    acc["online_count"] = 0
+                    acc["offline_count"] = 0
+                    acc["unknown_count"] = 0
+                    killed_accounts.append(acc)
+    return len(killed_accounts)
 
 # ----------------------------
 # Main logic
@@ -638,6 +680,12 @@ def main():
             if now >= next_presence:
                 # jalankan presence cycle
                 presence_cycle(accounts, cfg)
+
+                # cek max cek -> kill process
+                killed_max = check_and_kill_max_checks(accounts, cfg)
+                if killed_max > 0:
+                    log(f"Killed {killed_max} processes karena mencapai max checks")
+                    console.clear()
                 next_presence = now + presence_interval
 
             # Build live table display (always updated each loop iteration)
@@ -720,6 +768,7 @@ def main():
 
                 pid_str = str(pid) if pid else "-"
                 table.add_row(str(i), username_text, str(uid), pid_str, status_text)
+
 
             # Update live table
             live.update(table)
