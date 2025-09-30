@@ -23,15 +23,15 @@ console = Console()
 # Default config (merged into existing config if needed)
 DEFAULT_CONFIG = {
     "gameId": 2753915549,
-    "checkInterval": 10,         # interval untuk pengecekan presence/online (detik)
+    "checkInterval": 60,         # interval untuk pengecekan presence/online (detik)
     "ProcCheckInterval": 5,      # interval untuk pengecekan proses/pid/ram (detik). default 5s (bisa diubah)
     "maxOnlineChecks": 3,
     "maxOfflineChecks": 3,
     "launchDelay": 15,
     "accountLaunchCooldown": 30,      # jeda khusus tiap akun (mencegah double launch)
-    "TotalInstance": 10,
-    "WindowsPerRow": 3,
-    "FixedSize": "530x400",
+    "TotalInstance": 30,
+    "WindowsPerRow": 10,
+    "FixedSize": "10x30",
     "SortAccounts": True,
     "ArrangeWindows": True,
     "Kill Process > Ram": True,
@@ -158,7 +158,7 @@ def check_and_kill_high_ram_processes(accounts, ram_threshold_gb):
             ram_usage = get_process_ram_usage(pid)
             if ram_usage > ram_threshold_gb:
                 log(f"{acc['username']} menggunakan {ram_usage}GB RAM (> {ram_threshold_gb}GB) -> killing process ONLY")
-                if kill_pid(pid):
+                if kill_ram(pid):
                     # set pid None, counters reset agar proc-loop selanjutnya bisa mendeteksi offline dan start ulang
                     acc["pid"] = None
                     acc["offline_count"] = 0
@@ -253,14 +253,22 @@ def find_new_roblox_pid(before_pids, timeout=20):
         time.sleep(0.5)
     return None
 
-def kill_pid(pid):
+# Kill via RAM (replacing kill_pid)
+def kill_ram(pid, acc=None):
+    """Kill Roblox process via RAM (force kill)"""
     try:
         if pid and psutil.pid_exists(pid):
-            p = psutil.Process(pid)
-            p.kill()
+            proc = psutil.Process(pid)
+            proc.kill()
+            log(f"Process PID {pid} killed via RAM")
+            if acc:
+                acc["pid"] = None
+                acc["online_count"] = 0
+                acc["offline_count"] = 0
+                acc["unknown_count"] = 0
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Failed kill_ram PID {pid}: {e}")
     return False
 
 def is_process_running(pid):
@@ -340,7 +348,7 @@ def detect_and_kill_duplicate_accounts(accounts):
             for acc in acc_list[1:]:
                 pid = acc.get("pid")
                 if pid and is_roblox_process_running(pid):
-                    if kill_pid(pid):
+                    if kill_ram(pid):
                         log(f"Killed duplicate process PID {pid} for {username}")
                         killed_count += 1
                     else:
@@ -537,6 +545,13 @@ def proc_cycle(accounts, cfg, last_launch_time):
                 time.sleep(wait)
                 console.clear()
 
+            # Cek apakah ada akun dengan username sama yang sudah jalan → kill dulu
+            for other_acc in accounts:
+                if other_acc is not acc and other_acc["username"] == acc["username"] and other_acc.get("pid"):
+                    if is_roblox_process_running(other_acc["pid"]):
+                        log(f"Duplicate login terdeteksi untuk {acc['username']} -> killing instance lama via RAM")
+                        kill_ram(other_acc["pid"], other_acc)
+                        
             new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
             last_launch_time[0] = time.time()
             acc["last_launch"] = time.time()
@@ -606,7 +621,7 @@ def presence_cycle(accounts, cfg):
 def check_and_kill_max_checks(accounts, cfg):
     """
     Cek apakah counter presence (online/offline/unknown) sudah mencapai max.
-    Kalau ya, langsung kill PID (tanpa restart).
+    Kalau ya, langsung kill via RAM (tanpa restart).
     """
     killed_accounts = []
     max_online = int(cfg.get("maxOnlineChecks", 3))
@@ -617,28 +632,16 @@ def check_and_kill_max_checks(accounts, cfg):
         pid = acc.get("pid")
         if pid and is_roblox_process_running(pid):
             if acc["online_count"] >= max_online:
-                log(f"{acc['username']}: Online check max tercapai ({acc['online_count']}/{max_online}) -> killing process ONLY")
-                if kill_pid(pid):
-                    acc["pid"] = None
-                    acc["online_count"] = 0
-                    acc["offline_count"] = 0
-                    acc["unknown_count"] = 0
+                log(f"{acc['username']}: Online check max tercapai ({acc['online_count']}/{max_online}) -> killing via RAM")
+                if kill_ram(pid, acc):
                     killed_accounts.append(acc)
             elif acc["offline_count"] >= max_offline:
-                log(f"{acc['username']}: Offline check max tercapai ({acc['offline_count']}/{max_offline}) -> killing process ONLY")
-                if kill_pid(pid):
-                    acc["pid"] = None
-                    acc["online_count"] = 0
-                    acc["offline_count"] = 0
-                    acc["unknown_count"] = 0
+                log(f"{acc['username']}: Offline check max tercapai ({acc['offline_count']}/{max_offline}) -> killing via RAM")
+                if kill_ram(pid, acc):
                     killed_accounts.append(acc)
             elif acc["unknown_count"] >= max_unknown:
-                log(f"{acc['username']}: Unknown check max tercapai ({acc['unknown_count']}/{max_unknown}) -> killing process ONLY")
-                if kill_pid(pid):
-                    acc["pid"] = None
-                    acc["online_count"] = 0
-                    acc["offline_count"] = 0
-                    acc["unknown_count"] = 0
+                log(f"{acc['username']}: Unknown check max tercapai ({acc['unknown_count']}/{max_unknown}) -> killing via RAM")
+                if kill_ram(pid, acc):
                     killed_accounts.append(acc)
     return len(killed_accounts)
 
@@ -736,7 +739,7 @@ def main():
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("PID", width=8)
+            # table.add_column("PID", width=8)  # <-- kolom PID dihapus
             table.add_column("Status", width=45)
 
             for i, acc in enumerate(accounts, start=1):
@@ -744,20 +747,6 @@ def main():
                 uid = acc["user_id"]
                 name = acc["username"]
                 pid = acc.get("pid")
-
-                # get presence for display (we could avoid extra HTTP if presence was recently fetched in presence_cycle,
-                # but to keep status realtime we call get_presence once more but non-blocking would be better.
-                # Here we'll infer presence from counters to avoid too many calls.
-                # Simple heuristic for display:
-                if acc.get("offline_count", 0) > 0 and acc.get("online_count", 0) == 0 and acc.get("unknown_count", 0) == 0:
-                    presence_display = 0
-                elif acc.get("online_count", 0) > 0:
-                    presence_display = 1
-                elif acc.get("unknown_count", 0) > 0:
-                    presence_display = -1
-                else:
-                    # fallback - try a quick presence call (safe)
-                    presence_display = get_presence(cookie, uid)
 
                 pid_running = is_roblox_process_running(pid)
 
@@ -768,6 +757,16 @@ def main():
 
                 # Status message dengan informasi counter yang sesuai
                 status_msg = ""
+                presence_display = -1
+                if acc.get("offline_count", 0) > 0 and acc.get("online_count", 0) == 0 and acc.get("unknown_count", 0) == 0:
+                    presence_display = 0
+                elif acc.get("online_count", 0) > 0:
+                    presence_display = 1
+                elif acc.get("unknown_count", 0) > 0:
+                    presence_display = -1
+                else:
+                    presence_display = get_presence(cookie, uid)
+
                 if presence_display == 2:  # InGame
                     status_msg = "In Game ✅"
                 elif presence_display == 1:  # Online
@@ -786,31 +785,30 @@ def main():
                     else:
                         status_msg = f"Unknown [{acc['unknown_count']}/{cfg.get('maxOnlineChecks',3)}]"
 
-                # Buat teks dengan warna yang sesuai
+                # Styling warna
                 username_text = Text(name)
                 status_text = Text(status_msg)
-                
-                if presence_display == 2:  # InGame - hijau (ideal)
+
+                if presence_display == 2:
                     username_text.stylize("bold green")
                     status_text.stylize("bold green")
-                elif presence_display == 1:  # Online - biru
+                elif presence_display == 1:
                     username_text.stylize("bold blue")
                     status_text.stylize("bold blue")
-                elif presence_display == 0:  # Offline - merah
+                elif presence_display == 0:
                     username_text.stylize("bold red")
                     status_text.stylize("bold red")
-                else:  # Unknown - kuning
+                else:
                     username_text.stylize("bold yellow")
                     status_text.stylize("bold yellow")
 
-                # Highlight jika mendekati threshold
                 if (presence_display == 1 and acc["online_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1) or \
                    (presence_display == 0 and acc["offline_count"] >= int(cfg.get("maxOfflineChecks", 3)) - 1) or \
                    (presence_display == -1 and acc["unknown_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1):
                     status_text.stylize("bold magenta")
 
-                pid_str = str(pid) if pid else "-"
-                table.add_row(str(i), username_text, str(uid), pid_str, status_text)
+                # tambahkan row tanpa kolom PID
+                table.add_row(str(i), username_text, str(uid), status_text)
 
 
             # Update live table
