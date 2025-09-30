@@ -830,10 +830,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        log("Starting Roblox Multi-Instance Manager with Post-Launch Delay")
-        log("Fitur: - Delay SETELAH launch berhasil")
-        log("       - Support multi-instance Roblox") 
-        log("       - Improved process management")
+        log("Starting Roblox Multi-Instance")
         main()
     except KeyboardInterrupt:
         log("Program dihentikan oleh user")
