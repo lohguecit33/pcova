@@ -844,4 +844,7 @@ if __name__ == "__main__":
         log("       - Support multi-instance Roblox") 
         log("       - Improved process management")
         main()
-    except KeyboardInter
+    except KeyboardInterrupt:
+        log("Program dihentikan oleh user")
+    except Exception as e:
+        log(f"Error: {e}")
