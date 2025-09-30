@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "ProcCheckInterval": 5,      # interval untuk pengecekan proses/pid/ram (detik). default 5s (bisa diubah)
     "maxOnlineChecks": 3,
     "maxOfflineChecks": 3,
-    "launchDelay": 30,           # delay APPLIED AFTER launch (per-account cooldown)
+    "postLaunchDelay": 15,       # DELAY SETELAH LAUNCH (detik)
     "accountLaunchCooldown": 30, # jeda khusus tiap akun (mencegah double launch)
     "TotalInstance": 30,
     "WindowsPerRow": 10,
@@ -35,7 +35,8 @@ DEFAULT_CONFIG = {
     "SortAccounts": True,
     "ArrangeWindows": True,
     "Kill Process > Ram": True,
-    "Ram Usage (Each Process)": 3
+    "Ram Usage (Each Process)": 3,
+    "EnablePostLaunchDelay": True  # Fitur toggle untuk delay setelah launch
 }
 
 # Roblox exe names to detect
@@ -290,18 +291,34 @@ def is_roblox_process_running(pid):
         return False
 
 # ----------------------------
-# Launch / Assign PID
+# NEW: Post-Launch Delay Function
 # ----------------------------
-def launch_via_protocol(cookie, cfg_game_id):
+def apply_post_launch_delay(account_name, delay_seconds):
+    """Menerapkan delay SETELAH berhasil launch Roblox"""
+    if delay_seconds <= 0:
+        return
+    
+    log(f"{account_name}: Delay {delay_seconds} detik SETELAH launch...")
+    for remaining in range(delay_seconds, 0, -1):
+        log(f"{account_name}: Delay berakhir dalam {remaining} detik...")
+        time.sleep(1)
+    log(f"{account_name}: Delay selesai, melanjutkan...")
+
+# ----------------------------
+# Launch / Assign PID dengan Post-Launch Delay
+# ----------------------------
+def launch_via_protocol(cookie, cfg_game_id, account_name, config):
     """Return new pid if found, otherwise None."""
     ticket = get_auth_ticket(cookie)
     if not ticket:
         return None, "no-ticket"
+    
     protocol = (
         f"roblox-player:1+launchmode:play+gameinfo:{ticket}"
         f"+launchtime:{int(time.time()*1000)}"
         f"+placelauncherurl:https%3A%2F%2Fwww.roblox.com%2FGame%2FPlaceLauncher.ashx%3Frequest%3DRequestGame%26placeId%3D{cfg_game_id}"
     )
+    
     # capture current Roblox pids
     before = list_current_roblox_pids()
     try:
@@ -309,9 +326,14 @@ def launch_via_protocol(cookie, cfg_game_id):
         subprocess.Popen(["cmd", "/c", "start", "", protocol], shell=True)
     except Exception as e:
         return None, "start-failed"
+    
     # find new pid
     new_pid = find_new_roblox_pid(before, timeout=25)
     if new_pid:
+        # NEW: APPLY DELAY SETELAH LAUNCH BERHASIL
+        if config.get("EnablePostLaunchDelay", True):
+            delay_seconds = float(config.get("postLaunchDelay", 15))
+            apply_post_launch_delay(account_name, delay_seconds)
         return new_pid, "ok"
     return None, "no-new-pid"
 
@@ -454,7 +476,7 @@ def arrange_windows_for_pids(pid_ordered_list, config):
         pass  # ignore arrangement errors
 
 # ----------------------------
-# New: proc loop + presence loop logic
+# NEW: Improved proc loop dengan post-launch delay
 # ----------------------------
 def proc_cycle(accounts, cfg, last_launch_time):
     """
@@ -463,8 +485,29 @@ def proc_cycle(accounts, cfg, last_launch_time):
     - melakukan pengecekan RAM dan kill jika melebihi threshold (HANYA KILL)
     - memperbarui pid jika process baru ditemukan
     - tambahan: jika Roblox force close tapi presence akun masih Online/InGame -> force close hanya proses akun itu saja
+    - NEW: Delay diterapkan SETELAH launch berhasil
     """
     pid_order = []
+
+    # helper internal: force close hanya proses Roblox milik akun tertentu
+def proc_cycle(accounts, cfg, last_launch_time):
+    """
+    Fungsi ini berjalan di setiap ProcCheckInterval:
+    - memastikan proses Roblox berjalan bila presence offline tetapi pid tidak ada -> langsung launch
+    - melakukan pengecekan RAM dan kill jika melebihi threshold (HANYA KILL)
+    - memperbarui pid jika process baru ditemukan
+    - tambahan: jika Roblox force close tapi presence akun masih Online/InGame -> force close hanya proses akun itu saja
+    - sekarang: ada global delay antar akun (launchDelay)
+    """
+    pid_order = []
+    now = time.time()
+
+    # 1) Cek apakah sudah cukup waktu sejak launch akun terakhir (global launch delay)
+    if now - last_launch_time[0] < float(cfg.get("launchDelay", 30)):
+        # Belum boleh launch akun baru, cukup return PID order saja
+        for acc in accounts:
+            pid_order.append(acc.get("pid"))
+        return pid_order
 
     # helper internal: force close hanya proses Roblox milik akun tertentu
     def force_close_account_process(acc, timeout=3.0):
@@ -474,31 +517,17 @@ def proc_cycle(accounts, cfg, last_launch_time):
         try:
             proc = psutil.Process(pid)
             if proc.is_running():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=timeout)
-                except Exception:
-                    pass
-                if proc.is_running():
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                proc.kill()
                 log(f"{acc['username']}: force closed Roblox PID {pid}")
-        except psutil.NoSuchProcess:
+        except Exception:
             pass
-        except Exception as e:
-            log(f"{acc['username']}: Error force closing PID {pid}: {e}")
 
-    # 1) Deteksi duplicate dan kill duplicates
+    # 2) Deteksi duplicate dan kill duplicates
     killed_duplicates = detect_and_kill_duplicate_accounts(accounts)
     if killed_duplicates > 0:
         log(f"Killed {killed_duplicates} duplicate account processes")
 
-    # 2) Check RAM and kill heavy processes (only kill)
+    # 3) Check RAM and kill heavy processes (only kill)
     if cfg.get("Kill Process > Ram", False):
         ram_threshold = float(cfg.get("Ram Usage (Each Process)", 3))
         killed_count = check_and_kill_high_ram_processes(accounts, ram_threshold)
@@ -506,72 +535,47 @@ def proc_cycle(accounts, cfg, last_launch_time):
             log(f"Killed {killed_count} processes karena penggunaan RAM tinggi ")
             console.clear()
 
-    # 3) Untuk tiap akun, cek process existence + presence, dan jika process tidak berjalan & presence==Offline -> langsung launch
+    # 4) Untuk tiap akun, cek kondisi launch
     for acc in accounts:
         cookie = acc["cookie"]
         uid = acc["user_id"]
         name = acc["username"]
         pid = acc.get("pid")
 
-        # cek apakah PID masih berjalan dan benar process roblox
+        # cek apakah PID masih berjalan
         pid_running = is_roblox_process_running(pid)
         if not pid_running and pid is not None:
-            # jika pid tercatat tapi sudah mati, clear
             acc["pid"] = None
             pid = None
 
-        # ambil presence (may be -1 on error)
         presence = get_presence(cookie, uid)
 
-        # PER-ACCOUNT cooldown: jika masih dalam cooldown setelah launch sebelumnya, skip launching this account
-        now = time.time()
-        cooldown_until = acc.get("cooldown_until", 0)
-        if now < cooldown_until:
-            # masih cooldown untuk akun ini
-            # no launch, tapi tetap tambahkan pid order
-            pid_order.append(acc.get("pid"))
-            continue
-
-        # Jika process tidak berjalan DAN presence == Offline (0) -> langsung launch
-        # Juga: jika process tidak berjalan dan presence != InGame (2) -> kita juga bisa coba launch (safety)
-        if not pid and (presence == 0 or presence == -1 or presence == 1):
-            # cek cooldown per akun (accountLaunchCooldown) untuk mencegah double launch cepat pada akun yang sama
+        if not pid and (presence in (0, 1, -1)):
+            # cek cooldown per akun
             if now - acc.get("last_launch", 0) < float(cfg.get("accountLaunchCooldown", 30)):
-                pid_order.append(acc.get("pid"))
-                continue  # skip kalau masih cooldown akun
+                continue
 
-            if presence == 0 or presence == -1:
-                log(f"{name}: akun offline & presence={presence} -> launching")
-            else:
-                log(f"{name}: PID hilang tapi presence={presence} -> launching")
-
-            # Cek apakah ada akun dengan username sama yang sudah jalan → kill dulu
-            for other_acc in accounts:
-                if other_acc is not acc and other_acc["username"] == acc["username"] and other_acc.get("pid"):
-                    if is_roblox_process_running(other_acc["pid"]):
-                        log(f"Duplicate login terdeteksi untuk {acc['username']} -> killing instance lama via RAM")
-                        kill_ram(other_acc["pid"], other_acc)
-                        
-            # LAUNCH IMMEDIATELY (no pre-wait). Delay APPLIED AFTER launch via per-account cooldown.
-            new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"))
-            # record times and cooldown AFTER launch attempt
+            log(f"{name}: launching dengan global delay")
+            new_pid, reason = launch_via_protocol(cookie, cfg.get("gameId"), name, cfg)
+            last_launch_time[0] = time.time()   # update global delay
             acc["last_launch"] = time.time()
-            last_launch_time[0] = time.time()
-            acc["launching"] = False
-            # set per-account cooldown (this enforces "delay after launch")
-            acc["cooldown_until"] = time.time() + float(cfg.get("launchDelay", 15))
 
             if new_pid:
                 acc["pid"] = new_pid
                 acc["online_count"] = 0
                 acc["offline_count"] = 0
                 acc["unknown_count"] = 0
-                log(f"{name}: Berhasil launch -> PID {new_pid} (cooldown until {time.strftime('%H:%M:%S', time.localtime(acc['cooldown_until']))})")
+                log(f"{name}: Berhasil launch -> PID {new_pid}")
             else:
-                log(f"{name}: Gagal launch ({reason}) (cooldown until {time.strftime('%H:%M:%S', time.localtime(acc['cooldown_until']))})")
+                log(f"{name}: Gagal launch ({reason})")
                 console.clear()
-        # kalau pid ada dan jalan, nothing to do here (presence update dilakukan di presence loop)
-        pid_order.append(acc.get("pid"))
+
+            pid_order.append(acc.get("pid"))
+            break  # penting: cuma launch 1 akun per cycle
+        else:
+            pid_order.append(acc.get("pid"))
+
+    return pid_order
 
     # 3b) Tambahan logika:
     # Jika PID tercatat tapi proses Roblox sebenarnya hilang atau tidak valid,
@@ -677,9 +681,6 @@ def main():
                 "online_count": 0,
                 "offline_count": 0,
                 "unknown_count": 0,
-                "last_launch": 0,
-                "launching": False,
-                "cooldown_until": 0,  # per-account cooldown (applied AFTER launch)
             })
             log(f"Loaded {uname} ({uid})")
         else:
@@ -701,13 +702,10 @@ def main():
     # Mencocokkan proses yang sudah berjalan dengan akun
     match_existing_processes_to_accounts(accounts)
 
-    # Variables untuk mengontrol delay antar peluncuran
+    # Variables untuk mengontrol delay
     last_launch_time = [time.time()]  # Gunakan list untuk mutable reference
     presence_interval = float(cfg.get("checkInterval", 10))
     proc_interval = float(cfg.get("ProcCheckInterval", 5))
-
-    # Flag untuk menandai kapan terakhir presence check dilakukan
-    last_presence_time = 0.0
 
     # Clear screen sebelum memulai live table
     console.clear()
@@ -741,7 +739,7 @@ def main():
                 next_presence = now + presence_interval
 
             # Build live table display (always updated each loop iteration)
-            table = Table(title="Roblox Auto Rejoin Monitor (Live)", show_header=True, header_style="bold magenta")
+            table = Table(title="Roblox Multi-Instance Manager (Post-Launch Delay)", show_header=True, header_style="bold magenta")
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
@@ -790,37 +788,34 @@ def main():
                     else:
                         status_msg = f"Unknown [{acc['unknown_count']}/{cfg.get('maxOnlineChecks',3)}]"
 
-                # Tambahkan info cooldown ke status jika masih cooldown
-                cooldown_until = acc.get("cooldown_until", 0)
-                if time.time() < cooldown_until:
-                    remain = round(cooldown_until - time.time(), 1)
-                    status_msg += f" | Launch cooldown: {remain}s"
-
                 # Styling warna
                 username_text = Text(name)
                 status_text = Text(status_msg)
+                pid_text = Text(str(pid) if pid else "None")
 
                 if presence_display == 2:
                     username_text.stylize("bold green")
                     status_text.stylize("bold green")
+                    pid_text.stylize("bold green")
                 elif presence_display == 1:
                     username_text.stylize("bold blue")
                     status_text.stylize("bold blue")
+                    pid_text.stylize("bold blue")
                 elif presence_display == 0:
                     username_text.stylize("bold red")
                     status_text.stylize("bold red")
+                    pid_text.stylize("bold red")
                 else:
                     username_text.stylize("bold yellow")
                     status_text.stylize("bold yellow")
+                    pid_text.stylize("bold yellow")
 
                 if (presence_display == 1 and acc["online_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1) or \
                    (presence_display == 0 and acc["offline_count"] >= int(cfg.get("maxOfflineChecks", 3)) - 1) or \
                    (presence_display == -1 and acc["unknown_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1):
                     status_text.stylize("bold magenta")
 
-                # tambahkan row tanpa kolom PID
                 table.add_row(str(i), username_text, str(uid), status_text)
-
 
             # Update live table
             live.update(table)
@@ -830,13 +825,15 @@ def main():
                 arrange_windows_for_pids(pid_order_for_arrange, cfg)
 
             # small sleep to avoid busy loop; actual timing controlled by next_proc/next_presence
-            time.sleep(5.25)
+            time.sleep(0.25)
 
 
 if __name__ == "__main__":
     try:
-        log("Starting Roblox Auto Rejoin Monitor (Logic Updated: delay AFTER launch + multi-instance support)")
-        log("no delay lauch.")
+        log("Starting Roblox Multi-Instance Manager with Post-Launch Delay")
+        log("Fitur: - Delay SETELAH launch berhasil")
+        log("       - Support multi-instance Roblox") 
+        log("       - Improved process management")
         main()
     except KeyboardInterrupt:
         log("Program dihentikan oleh user")
