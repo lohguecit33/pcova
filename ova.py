@@ -751,7 +751,6 @@ def main():
             table.add_column("No.", justify="right", width=4)
             table.add_column("Username", min_width=15, overflow="fold")
             table.add_column("UserID", width=12)
-            table.add_column("PID", width=8)
             table.add_column("Status", width=45)
 
             for i, acc in enumerate(accounts, start=1):
@@ -824,7 +823,7 @@ def main():
                    (presence_display == -1 and acc["unknown_count"] >= int(cfg.get("maxOnlineChecks", 3)) - 1):
                     status_text.stylize("bold magenta")
 
-                table.add_row(str(i), username_text, str(uid), pid_text, status_text)
+                table.add_row(str(i), username_text, str(uid), status_text)
 
             # Update live table
             live.update(table)
